@@ -307,6 +307,58 @@ def _add_output_tensor_nodes_ssd(output_tensors,
         tf.add_to_collection(output_collection_name, outputs['detection_masks'])
     return outputs
 
+def _add_output_tensor_nodes_faster_rcnn(output_tensors,
+                                         postprocessed_tensors,
+                                         output_collection_name='inference_op'):
+    """Adds output nodes for detection boxes and scores.
+    Adds the following nodes for output tensors -
+      * num_detections: float32 tensor of shape [batch_size].
+      * detection_boxes: float32 tensor of shape [batch_size, num_boxes, 4]
+        containing detected boxes.
+      * detection_scores: float32 tensor of shape [batch_size, num_boxes]
+        containing scores for the detected boxes.
+      * detection_classes: float32 tensor of shape [batch_size, num_boxes]
+        containing class predictions for the detected boxes.
+      * rpn_features_to_crop : A 4-D float32 tensor with shape
+        [batch, height, width, depth] representing image features to crop using
+        the proposals boxes.
+      * detection_masks: (Optional) float32 tensor of shape
+        [batch_size, num_boxes, mask_height, mask_width] containing masks for each
+        detection box.
+    Args:
+      postprocessed_tensors: a dictionary containing the following fields
+        'detection_boxes': [batch, max_detections, 4]
+        'detection_scores': [batch, max_detections]
+        'detection_classes': [batch, max_detections]
+        'detection_masks': [batch, max_detections, mask_height, mask_width]
+          (optional).
+        'num_detections': [batch]
+      output_collection_name: Name of collection to add output tensors to.
+    Returns:
+      A tensor dict containing the added output tensor nodes.
+    """
+    label_id_offset = 1
+    boxes = postprocessed_tensors.get('detection_boxes')
+    scores = postprocessed_tensors.get('detection_scores')
+    classes = postprocessed_tensors.get('detection_classes') + label_id_offset
+    masks = postprocessed_tensors.get('detection_masks')
+    num_detections = postprocessed_tensors.get('num_detections')
+    rpn_features_to_crop = output_tensors.get('rpn_features_to_crop')
+
+    outputs = {}
+    outputs['detection_boxes'] = tf.identity(boxes, name='detection_boxes')
+    outputs['detection_scores'] = tf.identity(scores, name='detection_scores')
+    outputs['detection_classes'] = tf.identity(classes, name='detection_classes')
+    outputs['num_detections'] = tf.identity(num_detections, name='num_detections')
+    outputs['rpn_features_to_crop'] = tf.identity(rpn_features_to_crop, name='rpn_features_to_crop')
+
+    if masks is not None:
+        outputs['detection_masks'] = tf.identity(masks, name='detection_masks')
+    for output_key in outputs:
+        tf.add_to_collection(output_collection_name, outputs[output_key])
+    if masks is not None:
+        tf.add_to_collection(output_collection_name, outputs['detection_masks'])
+    return outputs
 
 def _write_frozen_graph(frozen_graph_path, frozen_graph_def):
   """Writes frozen graph to disk.
@@ -508,6 +560,62 @@ def _export_inference_graph_ssd(input_type,
     _write_saved_model(saved_model_path, frozen_graph_def, placeholder_tensor,
                        outputs)
 
+def _export_inference_graph_faster_rcnn(input_type,
+                                        detection_model,
+                                        use_moving_averages,
+                                        trained_checkpoint_prefix,
+                                        output_directory,
+                                        optimize_graph=False,
+                                        output_collection_name='inference_op'):
+    """Export helper."""
+    tf.gfile.MakeDirs(output_directory)
+    frozen_graph_path = os.path.join(output_directory,
+                                     'frozen_inference_graph.pb')
+    saved_model_path = os.path.join(output_directory, 'saved_model')
+    model_path = os.path.join(output_directory, 'model.ckpt')
+
+    if input_type not in input_placeholder_fn_map:
+        raise ValueError('Unknown input type: {}'.format(input_type))
+    placeholder_tensor, input_tensors = input_placeholder_fn_map[input_type]()
+    inputs = tf.to_float(input_tensors)
+    preprocessed_inputs = detection_model.preprocess(inputs)
+    output_tensors = detection_model.predict(preprocessed_inputs)
+    postprocessed_tensors = detection_model.postprocess(output_tensors)
+    outputs = _add_output_tensor_nodes_faster_rcnn(output_tensors,
+                                                   postprocessed_tensors,
+                                                   output_collection_name)
+
+    saver = None
+    if use_moving_averages:
+        variable_averages = tf.train.ExponentialMovingAverage(0.0)
+        variables_to_restore = variable_averages.variables_to_restore()
+        saver = tf.train.Saver(variables_to_restore)
+    else:
+        saver = tf.train.Saver()
+    input_saver_def = saver.as_saver_def()
+
+    _write_graph_and_checkpoint(
+        inference_graph_def=tf.get_default_graph().as_graph_def(),
+        model_path=model_path,
+        input_saver_def=input_saver_def,
+        trained_checkpoint_prefix=trained_checkpoint_prefix)
+
+    frozen_graph_def = freeze_graph_with_def_protos(
+        input_graph_def=tf.get_default_graph().as_graph_def(),
+        input_saver_def=input_saver_def,
+        input_checkpoint=trained_checkpoint_prefix,
+        output_node_names=','.join(outputs.keys()),
+        restore_op_name='save/restore_all',
+        filename_tensor_name='save/Const:0',
+        clear_devices=True,
+        optimize_graph=optimize_graph,
+        initializer_nodes='')
+    _write_frozen_graph(frozen_graph_path, frozen_graph_def)
+    _write_saved_model(saved_model_path, frozen_graph_def, placeholder_tensor,
+                       outputs)
+
+
+
 def export_inference_graph(input_type,
                            pipeline_config,
                            trained_checkpoint_prefix,
@@ -563,3 +671,27 @@ def export_inference_graph_ssd(input_type,
                                 pipeline_config.eval_config.use_moving_averages,
                                 trained_checkpoint_prefix, output_directory,
                                 optimize_graph, output_collection_name)
+
+def export_inference_graph_faster_rcnn(input_type,
+                                       pipeline_config,
+                                       trained_checkpoint_prefix,
+                                       output_directory,
+                                       optimize_graph=False,
+                                       output_collection_name='inference_op'):
+    """Exports inference graph for the model specified in the pipeline config.
+    Args:
+      input_type: Type of input for the graph. Can be one of [`image_tensor`,
+        `tf_example`].
+      pipeline_config: pipeline_pb2.TrainAndEvalPipelineConfig proto.
+      trained_checkpoint_prefix: Path to the trained checkpoint file.
+      output_directory: Path to write outputs.
+      optimize_graph: Whether to optimize graph using Grappler.
+      output_collection_name: Name of collection to add output tensors to.
+        If None, does not add output tensors to a collection.
+    """
+    detection_model = model_builder.build(pipeline_config.model,
+                                          is_training=False)
+    _export_inference_graph_faster_rcnn(input_type, detection_model,
+                                        pipeline_config.eval_config.use_moving_averages,
+                                        trained_checkpoint_prefix, output_directory,
+                                        optimize_graph, output_collection_name)
